@@ -19,7 +19,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Optional
 import logging
 
 import numpy as np
@@ -162,92 +162,110 @@ def build_targets(df: pd.DataFrame, k: int) -> pd.DataFrame:
 	return df
 
 
-def build_feature_row(df: pd.DataFrame, t: pd.Timestamp) -> Dict[str, float]:
-	# slice strictly past window
-	win = df.loc[t - pd.Timedelta(minutes=SEQ_LEN) : t - pd.Timedelta(minutes=1)]
-	r1 = df["r1"]
-	def sum_last(n: int) -> float:
-		return float(r1.loc[t - pd.Timedelta(minutes=n) : t - pd.Timedelta(minutes=1)].sum())
+def _compute_contiguous_window_mask(index: pd.DatetimeIndex, window: int) -> np.ndarray:
+	"""Return boolean mask (aligned to index) where a full prior `window` minutes exist.
 
-	feats: Dict[str, float] = {
-		"r_1m": float(r1.loc[t - pd.Timedelta(minutes=1)]),
-		"r_2m": sum_last(2),
-		"r_5m": sum_last(5),
-		"r_10m": sum_last(10),
-		"r_15m": sum_last(15),
-		"r_60m": sum_last(60),
-	}
-	# Z scores of returns
-	r1_roll = r1.copy()
-	feats.update(
-		{
-			"rz_5m": float(zscore(r1_roll, 5).loc[t - pd.Timedelta(minutes=1)]),
-			"rz_15m": float(zscore(r1_roll, 15).loc[t - pd.Timedelta(minutes=1)]),
-			"rz_30m": float(zscore(r1_roll, 30).loc[t - pd.Timedelta(minutes=1)]),
-		}
-	)
-	# Realized vol & ranges (past value at t-1)
-	feats.update(
-		{
-			"rv_5m": float(rolling_std(r1, 5).loc[t - pd.Timedelta(minutes=1)]),
-			"rv_10m": float(rolling_std(r1, 10).loc[t - pd.Timedelta(minutes=1)]),
-			"rv_30m": float(rolling_std(r1, 30).loc[t - pd.Timedelta(minutes=1)]),
-			"pkn_5": float(df["parkinson_5"].loc[t - pd.Timedelta(minutes=1)]),
-			"pkn_15": float(df["parkinson_15"].loc[t - pd.Timedelta(minutes=1)]),
-			"atr5": float(df["atr_5"].loc[t - pd.Timedelta(minutes=1)]),
-			"atr14": float(df["atr_14"].loc[t - pd.Timedelta(minutes=1)]),
-		}
-	)
-	# Time of day features (NY session already 12:00-20:59). Use UTC naive -> treat as UTC.
-	hour = t.hour
-	minute = t.minute
-	feats.update(
-		{
-			"tod_sin": math.sin(2 * math.pi * hour / 24.0),
-			"tod_cos": math.cos(2 * math.pi * hour / 24.0),
-			"min_sin": math.sin(2 * math.pi * minute / 60.0),
-			"min_cos": math.cos(2 * math.pi * minute / 60.0),
-			"min_to_hour_end": float(60 - minute),
-		}
-	)
+	For prediction time t (index position i) we require the previous `window` minutes
+	[t-window, t-1] be present contiguously. Implementation derives run-lengths of
+	contiguous 1-minute spacing and shifts by one.
+	"""
+	if len(index) == 0:
+		return np.array([], dtype=bool)
+	diff = index.to_series().diff().dt.total_seconds().fillna(60) / 60.0
+	arr = diff.to_numpy()
+	run = np.empty_like(arr, dtype=int)
+	run[0] = 1
+	for i in range(1, len(arr)):
+		if arr[i] == 1.0:
+			run[i] = run[i - 1] + 1
+		else:
+			run[i] = 1
+	# Need run-length at t-1 (previous row) >= window
+	has_window = np.zeros(len(arr), dtype=bool)
+	has_window[1:] = run[:-1] >= window
+	return has_window
+
+
+def build_feature_matrix(df: pd.DataFrame) -> Tuple[pd.DataFrame, np.ndarray]:
+	"""Vectorized construction of all feature columns (excluding targets).
+
+	Returns DataFrame of features aligned to df.index (prediction times) and a boolean
+	mask indicating which rows have a full prior SEQ_LEN-minute history.
+	"""
+	r1 = df["r1"]
+	features = pd.DataFrame(index=df.index)
+	# Return aggregations (past-only, ending at t-1)
+	features["r_1m"] = r1.shift(1)
+	for n in [2, 5, 10, 15, 60]:
+		col = f"r_{n}m" if n != 2 else "r_2m"
+		features[col] = r1.rolling(n).sum().shift(1)
+	# Z-scores of returns
+	for win in [5, 15, 30]:
+		features[f"rz_{win}m"] = zscore(r1, win).shift(1)
+	# Realized volatility and range measures (shifted to be past-only)
+	features["rv_5m"] = rolling_std(r1, 5).shift(1)
+	features["rv_10m"] = rolling_std(r1, 10).shift(1)
+	features["rv_30m"] = rolling_std(r1, 30).shift(1)
+	for col in ["parkinson_5", "parkinson_15", "atr_5", "atr_14"]:
+		features[col.replace("atr_", "atr").replace("parkinson_", "pkn_") if col.startswith("parkinson_") else col] = df[col].shift(1)
+	# Rename corrections for pkn & atr
+	features.rename(columns={
+		"parkinson_5": "pkn_5",
+		"parkinson_15": "pkn_15",
+		"atr_5": "atr5",
+		"atr_14": "atr14",
+	}, inplace=True)
+	# Time-of-day (computed at prediction timestamp t)
+	idx = features.index
+	hours = idx.hour.to_numpy()
+	minutes = idx.minute.to_numpy()
+	features["tod_sin"] = np.sin(2 * np.pi * hours / 24.0)
+	features["tod_cos"] = np.cos(2 * np.pi * hours / 24.0)
+	features["min_sin"] = np.sin(2 * np.pi * minutes / 60.0)
+	features["min_cos"] = np.cos(2 * np.pi * minutes / 60.0)
+	features["min_to_hour_end"] = 60 - minutes
 	# Volume features
 	vol = df["Volume"]
-	feats.update(
-		{
-			"vol_z_5": float(zscore(vol, 5).loc[t - pd.Timedelta(minutes=1)]),
-			"vol_z_30": float(zscore(vol, 30).loc[t - pd.Timedelta(minutes=1)]),
-			"vol_z_120": float(zscore(vol, 120).loc[t - pd.Timedelta(minutes=1)]),
-		}
-	)
-	feats["vol_spike"] = 1.0 if feats["vol_z_30"] >= 2.0 else 0.0
-	# vol_to_volratio - price rv_30m in denominator
-	denom = feats["rv_30m"] if feats["rv_30m"] not in (0.0, np.nan) else 1e-8
-	feats["vol_to_volratio"] = feats["vol_z_30"] / denom
-	return feats
+	for win in [5, 30, 120]:
+		features[f"vol_z_{win}"] = zscore(vol, win).shift(1)
+	features["vol_spike"] = (features["vol_z_30"] >= 2.0).astype(float)
+	# vol_to_volratio
+	denom = features["rv_30m"].replace(0, np.nan)
+	features["vol_to_volratio"] = features["vol_z_30"] / denom
+	features["vol_to_volratio"] = features["vol_to_volratio"].replace([np.inf, -np.inf], np.nan)
+	# Contiguous window mask
+	has_window = _compute_contiguous_window_mask(df.index, SEQ_LEN)
+	return features, has_window
 
 
-def build_dataset(df: pd.DataFrame, k: int) -> pd.DataFrame:
-	# Build targets columns if not already
+def build_dataset(
+	df: pd.DataFrame,
+	k: int,
+	features: pd.DataFrame,
+	has_window: np.ndarray,
+) -> pd.DataFrame:
+	"""Assemble dataset for horizon k using precomputed feature matrix.
+
+	Parameters
+	----------
+	df : DataFrame with base & target series
+	k : horizon minutes ahead
+	features : DataFrame of feature columns (past-only aligned to df.index)
+	has_window : bool array indicating full prior SEQ_LEN coverage
+	"""
+	# Targets
 	df = build_targets(df, k)
 	sign_col = f"y_sign_{k}"
 	mag_col = f"y_mag_{k}"
-	# Candidate prediction times: choose all timestamps (could filter to top-of-hour if desired)
-	# For now every minute within data range where targets valid
-	valid_times: List[pd.Timestamp] = []
-	for t in df.index:
-		if pd.isna(df.loc[t, sign_col]):
-			continue
-		future_t = t + pd.Timedelta(minutes=k)
-		if future_t not in df.index:
-			continue
-		if one_hour_window_ok(df, t):
-			valid_times.append(t)
-	rows: List[Dict[str, float]] = []
-	for t in valid_times:
-		rows.append(build_feature_row(df, t))
-	X = pd.DataFrame(rows, index=valid_times)
-	X[sign_col] = df.loc[valid_times, sign_col].values
-	X[mag_col] = df.loc[valid_times, mag_col].values
+	# Future existence mask
+	future_idx = df.index + pd.Timedelta(minutes=k)
+	future_exists = future_idx.isin(df.index)
+	# Valid mask: has full history and future exists and target not NaN
+	valid_mask = has_window & future_exists & (~df[sign_col].isna())
+	# Subset
+	X = features.loc[valid_mask].copy()
+	X[sign_col] = df.loc[valid_mask, sign_col].values
+	X[mag_col] = df.loc[valid_mask, mag_col].values
 	return X
 
 
@@ -265,8 +283,11 @@ def _process_symbol(args: Tuple[str, str]):
 	symbol = csv_path.stem
 	df = read_cleaned(csv_path)
 	df = build_base_series(df)
+	# Precompute vectorized features once per symbol
+	features, has_window = build_feature_matrix(df)
 	for k in HORIZONS:
-		ds = build_dataset(df.copy(), k)
+		# Note: build_dataset adds target columns based on df copy to avoid cross-horizon overwrite
+		ds = build_dataset(df.copy(), k, features, has_window)
 		out_path = featured_root / f"{k}m" / f"{symbol}.parquet"
 		ds.to_parquet(out_path)
 	return symbol

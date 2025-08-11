@@ -3,3 +3,4 @@ models/
 data/
 stats/
 .env
+lib/__pycache__/

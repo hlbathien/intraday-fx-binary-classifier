@@ -20,10 +20,18 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
+import logging
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+# Parallel utility
+try:  # pragma: no cover - import resolution
+	from lib.parallel import parallel_map, determine_workers
+except Exception:  # fallback sequential
+	parallel_map = None  # type: ignore
+	determine_workers = lambda: 1  # type: ignore
 
 # ---------------- Configuration ---------------- #
 
@@ -243,22 +251,47 @@ def build_dataset(df: pd.DataFrame, k: int) -> pd.DataFrame:
 	return X
 
 
+def _process_symbol(args: Tuple[str, str]):
+	"""Worker: compute all horizon datasets for one symbol.
+
+	Parameters
+	----------
+	args : tuple[str, str]
+		(csv_path_str, featured_dir_str)
+	"""
+	csv_path_str, featured_dir_str = args
+	csv_path = Path(csv_path_str)
+	featured_root = Path(featured_dir_str)
+	symbol = csv_path.stem
+	df = read_cleaned(csv_path)
+	df = build_base_series(df)
+	for k in HORIZONS:
+		ds = build_dataset(df.copy(), k)
+		out_path = featured_root / f"{k}m" / f"{symbol}.parquet"
+		ds.to_parquet(out_path)
+	return symbol
+
+
 def main():  # pragma: no cover
+	logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+	logger = logging.getLogger("features")
 	paths = load_config()
 	csv_files = list(iter_cleaned_csv(paths.cleaned))
 	if not csv_files:
-		print(f"No cleaned CSV files in {paths.cleaned}")
+		logger.warning("No cleaned CSV files in %s", paths.cleaned)
 		return 1
 	for horizon in HORIZONS:
 		(paths.featured / f"{horizon}m").mkdir(parents=True, exist_ok=True)
-	for f in tqdm(csv_files, desc="Symbols"):
-		symbol = f.stem
-		df = read_cleaned(f)
-		df = build_base_series(df)
-		for k in HORIZONS:
-			ds = build_dataset(df.copy(), k)
-			out_path = paths.featured / f"{k}m" / f"{symbol}.parquet"
-			ds.to_parquet(out_path)
+	logger.info("Generating features for %d symbols across horizons %s", len(csv_files), HORIZONS)
+	work_args = [(str(p), str(paths.featured)) for p in csv_files]
+	if parallel_map is not None and len(work_args) > 1:
+		workers = determine_workers()
+		logger.info("Using %d worker processes", workers)
+		parallel_map(_process_symbol, work_args, workers=workers, desc="Symbols")
+	else:
+		for a in tqdm(work_args, desc="Symbols"):
+			_process_symbol(a)
+	logger.info("Completed feature generation.")
 	return 0
 
 

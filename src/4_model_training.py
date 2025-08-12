@@ -1,13 +1,30 @@
-"""Step 4 main: Train & evaluate models per symbol & horizon."""
+"""Step 4 main: Train & evaluate models per symbol & horizon.
+
+Ensures project root is on sys.path so that 'lib' imports resolve regardless of CWD.
+"""
 from __future__ import annotations
 
-import json, logging, pickle
+import json, logging, pickle, sys
 from pathlib import Path
 from typing import Dict, List, Any
 import numpy as np, pandas as pd
 from tqdm import tqdm
+
+# --- Ensure root path for 'lib' imports when running from src/ directory ---
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 from lib.config import load_config
-from lib.modeling import (build_models, train_model, calibrate_sign_prob, predict_proba_sign, predict_mag, optimize_thresholds, evaluate_on_set)
+from lib.modeling import (
+    build_models,
+    train_model,
+    calibrate_sign_prob,
+    predict_proba_sign,
+    predict_mag,
+    optimize_thresholds,
+    evaluate_on_set,
+)
 
 HORIZONS = [1,5,10,15]
 F_MAX = 0.02

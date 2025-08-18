@@ -25,6 +25,7 @@ from lib.modeling import (
     predict_proba_sign,
     predict_mag,
     optimize_thresholds,
+    optimize_accuracy_threshold,
     evaluate_on_set,
 )
 
@@ -91,19 +92,27 @@ def _run_symbol(sym: str, cfg):
             Xtr_seq, Xv_seq, Xte_seq = seq[idx_tr], seq[idx_v], seq[idx_te]
             yS_tr, yS_v, yS_te = yS[idx_tr], yS[idx_v], yS[idx_te]
             yM_tr, yM_v, yM_te = yM[idx_tr], yM[idx_v], yM[idx_te]
-            models = build_models(seq.shape[-1])
-            best=None; best_name=None; best_ev=-1e9; best_cal=None; best_thresh=(0.6, float(np.median(np.abs(yM_v))))
+            models = build_models(seq.shape[-1], k)
+            best=None; best_name=None; best_acc=-1.0; best_cal=None; best_thresh_acc=0.5; best_ev_tuple=(0.6, float(np.median(np.abs(yM_v))))
             for name, spec in models.items():
                 bundle = train_model(spec, Xtr_tab, Xtr_seq, yS_tr, yM_tr, Xv_tab, Xv_seq, yS_v, yM_v)
                 calib = calibrate_sign_prob(bundle, Xv_tab, Xv_seq, yS_v)
-                p_val = predict_proba_sign(bundle, Xv_tab, Xv_seq); p_val = calib.predict(p_val) if hasattr(calib,'predict') else p_val
-                m_val = predict_mag(bundle, Xv_tab, Xv_seq)
-                ev_val,(p_star,theta)=optimize_thresholds(p_val, m_val, yS_v)
-                if ev_val>best_ev:
-                    best_ev=ev_val; best=bundle; best_name=name; best_cal=calib; best_thresh=(p_star,theta)
+                p_val_raw = predict_proba_sign(bundle, Xv_tab, Xv_seq)
+                p_val = calib.predict(p_val_raw) if hasattr(calib,'predict') else p_val_raw
+                # Accuracy-threshold optimization (0.45-0.65)
+                acc, t_star = optimize_accuracy_threshold(p_val, yS_v, lo=0.45, hi=0.65, step=0.01)
+                if acc>best_acc:
+                    best_acc=acc; best=bundle; best_name=name; best_cal=calib; best_thresh_acc=t_star
+                    # Also compute EV thresholds (keep both for analysis)
+                    m_val = predict_mag(bundle, Xv_tab, Xv_seq)
+                    _ev_val, ev_pair = optimize_thresholds(p_val, m_val, yS_v)
+                    best_ev_tuple = ev_pair
             if best is None: continue
-            metrics = evaluate_on_set(best, best_cal, best_thresh[0], best_thresh[1], Xte_tab, Xte_seq, yS_te, f_max=F_MAX)
-            metrics['model']=best_name
+            # Evaluate on test using accuracy threshold (prob-only) -> treat magnitude theta from EV search for trade filtering
+            p_star_acc = float(best_thresh_acc)
+            theta_ev = float(best_ev_tuple[1]) if isinstance(best_ev_tuple, tuple) else float(np.median(np.abs(yM_v)))
+            metrics = evaluate_on_set(best, best_cal, p_star_acc, theta_ev, Xte_tab, Xte_seq, yS_te, f_max=F_MAX)
+            metrics['model']=best_name; metrics['val_best_accuracy']=best_acc; metrics['p_star_accuracy']=p_star_acc; metrics['theta_from_ev']=theta_ev
             (hz_dir / f'metrics_fold_{i}.json').write_text(json.dumps(metrics, indent=2))
             fold_metrics.append(metrics)
             # Persist model (per best fold) & artifacts with fold id
@@ -112,7 +121,7 @@ def _run_symbol(sym: str, cfg):
             else:
                 with open(hz_dir / f'best_model_{best_name}_fold_{i}.pkl','wb') as f: pickle.dump(best, f)
             with open(hz_dir / f'calibrator_fold_{i}.pkl','wb') as f: pickle.dump(best_cal, f)
-            (hz_dir/ f'thresholds_fold_{i}.json').write_text(json.dumps({'p_star': best_thresh[0], 'theta': best_thresh[1]}, indent=2))
+            (hz_dir/ f'thresholds_fold_{i}.json').write_text(json.dumps({'p_star_accuracy': p_star_acc, 'theta_from_ev': theta_ev}, indent=2))
             fold_meta.append({'fold': i, 'train': sp['train'], 'val': sp['val'], 'test': sp['test'], 'n_train': len(idx_tr), 'n_val': len(idx_v), 'n_test': len(idx_te)})
         (hz_dir / 'agg_metrics.json').write_text(json.dumps({**_agg(fold_metrics), 'horizons_used': horizons}, indent=2))
         (hz_dir / 'fold_meta.json').write_text(json.dumps({'folds': fold_meta}, indent=2))

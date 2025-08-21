@@ -486,6 +486,9 @@ def evaluate_on_set(bundle: Dict[str, Any], calib: Any, p_star: float, theta: fl
     payoffs = raw_payoffs * (sizes if len(sizes)==len(raw_payoffs) else 1.0)
     ev_per_trade = float(payoffs.mean()) if trade_mask.any() else 0.0
     total_ev = float(payoffs.sum())
+    # Gross return metrics (unit-sized trades irrespective of position sizing)
+    gross_return = float(raw_payoffs.sum()) if trade_mask.any() else 0.0
+    gross_return_per_trade = float(raw_payoffs.mean()) if trade_mask.any() else 0.0
     brier=float(brier_score_loss(y_sign, p_hat))
     ece=expected_calibration_error(p_hat, y_sign)
     try: roc=float(roc_auc_score(y_sign, p_hat))
@@ -493,7 +496,18 @@ def evaluate_on_set(bundle: Dict[str, Any], calib: Any, p_star: float, theta: fl
     try: pr=float(average_precision_score(y_sign, p_hat))
     except Exception: pr=float('nan')
     acc_default = float(((p_hat >= 0.5).astype(int) == y_sign).mean())
-    return {"n_trades": int(trade_mask.sum()), "ev_per_trade": ev_per_trade, "total_ev": total_ev, "brier": brier, "ece": ece, "pr_auc": pr, "roc_auc": roc, "p_star": p_star, "theta": theta, "acc@0.5": acc_default}
+    return {"n_trades": int(trade_mask.sum()),
+            "ev_per_trade": ev_per_trade,
+            "total_ev": total_ev,
+            "gross_return": gross_return,
+            "gross_return_per_trade": gross_return_per_trade,
+            "brier": brier,
+            "ece": ece,
+            "pr_auc": pr,
+            "roc_auc": roc,
+            "p_star": p_star,
+            "theta": theta,
+            "acc@0.5": acc_default}
 
 
 __all__ = [
